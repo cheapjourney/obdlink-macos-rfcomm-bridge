@@ -1,0 +1,15 @@
+# Build output
+build/
+.build/
+*.o
+*.dSYM/
+.DS_Store
+
+# Runtime state
+*.log
+*.pid
+
+# Editor / tooling
+.vscode/
+.idea/
+*.swp
