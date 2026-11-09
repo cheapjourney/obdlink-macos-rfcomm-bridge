@@ -288,7 +288,26 @@ func runSelfTest(port: UInt16) -> Never {
                     && mb.partial.isEmpty,
                  multi.joined(separator: "|"))
 
-    // 7. close and verify the port is released
+    // 7. a 295-byte dump arrives as 43 lines; they must survive RFCOMM chunking.
+    //    This is the shape 21 7F would have on the wire, delivered in three
+    //    uneven chunks that cut through the middle of lines.
+    let dumpText = (0..<43).map { String(format: "76D %02X 11 22 33 44 55 66 77\r", $0) }.joined()
+    let dumpBytes = Array(dumpText.utf8)
+    let lb43 = LineBuffer()
+    var got43: [String] = []
+    var from = 0
+    for cut in [dumpBytes.count / 3, (dumpBytes.count * 2) / 3, dumpBytes.count] {
+        lb43.append(Data(dumpBytes[from..<cut]))
+        from = cut
+        while let line = lb43.popLine() { got43.append(line) }
+    }
+    report.check("line buffer handles a 43-frame answer split in 3 chunks",
+                 got43.count == 43 && lb43.partial.isEmpty
+                    && got43.first == "76D 00 11 22 33 44 55 66 77"
+                    && got43.last == "76D 2A 11 22 33 44 55 66 77",
+                 "\(got43.count) lines")
+
+    // 8. close and verify the port is released
     if serverFD >= 0 { close(serverFD) }
     close(client)
     close(listener.fd)
