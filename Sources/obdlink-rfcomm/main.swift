@@ -25,6 +25,11 @@ struct Config {
     var verbose = false
     var selfTest = false
     var showHelp = false
+    // phase 4.1 secured mode (additive; without --unix-socket nothing changes)
+    var unixSocket: String? = nil
+    var mode: BridgeMode = .adapterOnly
+    var vehicleToken: String? = nil
+    var simulateTransport = false
 }
 
 let usage = """
@@ -43,6 +48,18 @@ OPTIONS
   -c, --channel <n>       RFCOMM channel, 1-30 (default 1)
   -v, --verbose           log connection detail to stderr
       --self-test         run loopback/TCP tests without Bluetooth and exit
+
+SECURED MODE (phase 4.1, Unix socket + newline-delimited JSON)
+      --unix-socket <path>  serve the JSON protocol on this socket instead of raw TCP
+      --mode <m>            simulation | adapter-only | vehicle-readonly
+                            (default adapter-only; fixed for the process lifetime)
+      --simulate            shorthand for --mode simulation (fake adapter, no Bluetooth)
+      --vehicle-token <t>   required in vehicle-readonly; must match the client's token
+      --simulate-transport  test-only: fake adapter with a real gate (no Bluetooth)
+
+In secured mode the raw TCP listener is NOT started, so it cannot bypass the
+command gate. Socket directory 0700, socket 0600.
+
   -h, --help              show this help
 
 EXIT CODES
@@ -85,6 +102,16 @@ func parseConfig(_ argv: [String]) -> Config {
             let raw = value(arg)
             guard let v = UInt8(raw), v >= 1, v <= 30 else { fail("invalid channel: \(raw)", code: 2) }
             cfg.channel = v
+        case "--unix-socket": cfg.unixSocket = value(arg)
+        case "--mode":
+            let raw = value(arg)
+            guard let m = BridgeMode(rawValue: raw) else {
+                fail("invalid mode: \(raw) (simulation|adapter-only|vehicle-readonly)", code: 2)
+            }
+            cfg.mode = m
+        case "--simulate": cfg.mode = .simulation
+        case "--simulate-transport": cfg.simulateTransport = true
+        case "--vehicle-token": cfg.vehicleToken = value(arg)
         case "-v", "--verbose": cfg.verbose = true
         case "--self-test": cfg.selfTest = true
         case "-h", "--help": cfg.showHelp = true
@@ -297,6 +324,36 @@ if cfg.showHelp {
 
 if cfg.selfTest {
     runSelfTest(port: cfg.port)
+}
+
+// MARK: secured mode (phase 4.1) - takes precedence, never starts the TCP relay
+
+if let socketPath = cfg.unixSocket {
+    if cfg.mode != .simulation && !cfg.simulateTransport && cfg.address.isEmpty {
+        fail("--address is required unless the transport is simulated", code: 2)
+    }
+    if cfg.mode == .vehicleReadonly, (cfg.vehicleToken ?? "").isEmpty {
+        fail("--vehicle-token is required in vehicle-readonly mode", code: 2)
+    }
+    let transport: AdapterTransport
+    if cfg.mode == .simulation || cfg.simulateTransport {
+        transport = SimulatedAdapter()
+    } else {
+        let rfcomm = RfcommTransport()
+        guard rfcomm.open(address: normaliseAddress(cfg.address), channel: cfg.channel) else {
+            fail("RFCOMM channel \(cfg.channel) open failed", code: 5)
+        }
+        transport = rfcomm
+    }
+    let bridge = SecuredBridge(socketPath: socketPath, mode: cfg.mode,
+                               transport: transport, vehicleToken: cfg.vehicleToken)
+    do {
+        try bridge.identify()
+    } catch {
+        fail("adapter identification failed: \(error)", code: 5)
+    }
+    signal(SIGPIPE, SIG_IGN)
+    bridge.run()
 }
 
 guard !cfg.address.isEmpty else {

@@ -1,5 +1,5 @@
 BINARY := build/obdlink-rfcomm
-SOURCE := Sources/obdlink-rfcomm/main.swift
+SOURCES := $(wildcard Sources/obdlink-rfcomm/*.swift)
 PREFIX ?= /usr/local
 SWIFTC ?= swiftc
 
@@ -9,9 +9,9 @@ all: build
 
 build: $(BINARY)
 
-$(BINARY): $(SOURCE)
+$(BINARY): $(SOURCES)
 	@mkdir -p build
-	$(SWIFTC) -O $(SOURCE) -o $(BINARY)
+	$(SWIFTC) -O $(SOURCES) -o $(BINARY)
 
 test: $(BINARY)
 	@./$(BINARY) --self-test
