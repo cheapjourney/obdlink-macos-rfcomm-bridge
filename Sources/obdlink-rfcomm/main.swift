@@ -346,13 +346,30 @@ if let socketPath = cfg.unixSocket {
         transport = rfcomm
     }
     let bridge = SecuredBridge(socketPath: socketPath, mode: cfg.mode,
-                               transport: transport, vehicleToken: cfg.vehicleToken)
+                               transport: transport, vehicleToken: cfg.vehicleToken,
+                               verbose: cfg.verbose)
     do {
         try bridge.identify()
     } catch {
         fail("adapter identification failed: \(error)", code: 5)
     }
     signal(SIGPIPE, SIG_IGN)
+    // remove the socket on the way out - a stale node would block the next start
+    var sources: [DispatchSourceSignal] = []
+    let signalQueue = DispatchQueue(label: "obdlink-rfcomm.signals")
+    for sig in [SIGINT, SIGTERM] {
+        signal(sig, SIG_IGN)
+        // own queue: the main thread is blocked in accept() and never runs a loop
+        let src = DispatchSource.makeSignalSource(signal: sig, queue: signalQueue)
+        src.setEventHandler {
+            unlink(socketPath)
+            FileHandle.standardError.write("bridge stopped\n".data(using: .utf8)!)
+            exit(0)
+        }
+        src.resume()
+        sources.append(src)
+    }
+    _ = sources   // keep alive for the process lifetime
     bridge.run()
 }
 

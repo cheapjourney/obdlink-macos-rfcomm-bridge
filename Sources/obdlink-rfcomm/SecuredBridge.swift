@@ -65,31 +65,52 @@ struct Gate {
         case blocked(String)
     }
 
+    /// Commands permitted in adapter-only (and simulation). Everything here is
+    /// adapter-local identification or formatting; none of them selects a
+    /// protocol, sets an address, or can emit a CAN frame. The first hardware
+    /// test needs nothing beyond ATI/STDI/STI, so the list stays minimal.
+    static let adapterOnlyCommands: Set<String> = [
+        "ATI", "STI", "STDI", "ATZ", "AT@1",
+        "ATE0", "ATE1", "ATL0", "ATL1", "ATS0", "ATS1", "ATH0", "ATH1",
+        "ATD0", "ATD1", "ATCAF0", "ATCAF1", "ATRV",
+    ]
+
+    /// Deliberately absent from adapter-only: ATSH, ATCRA, STP, STCAF,
+    /// STCFCPA, ATAT, STPTO, ATSP6, ATCFC, ATFCSM, ATAL, ATDP. They configure
+    /// protocol or addressing and only make sense once the vehicle session is
+    /// authorised - they live in vehicle-readonly.
+
     static func check(_ rawLine: String, mode: BridgeMode) -> Verdict {
         let s = rawLine.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         if s.isEmpty { return .blocked("leere Zeile") }
 
-        if s.range(of: atPattern, options: .regularExpression) != nil {
-            if s.hasPrefix("STPTO ") {
-                let parts = s.split(separator: " ")
-                if parts.count == 2, let ms = Int(parts[1]), ms >= 1, ms <= 65535 {
-                    return .allowed
+        if mode.allowsDiagnosticReads {
+            // vehicle-readonly: adapter configuration plus allowlisted reads
+            if s.range(of: atPattern, options: .regularExpression) != nil {
+                if s.hasPrefix("STPTO ") {
+                    let parts = s.split(separator: " ")
+                    if parts.count == 2, let ms = Int(parts[1]), ms >= 1, ms <= 65535 {
+                        return .allowed
+                    }
+                    return .blocked("STPTO außerhalb 1..65535")
                 }
-                return .blocked("STPTO außerhalb 1..65535")
+                return .allowed
             }
-            return .allowed
+            if s.hasPrefix("21") || s.hasPrefix("22") {
+                return mfdReads.contains(s) ? .allowed : .blocked("\(s) ist nicht in der Allowlist")
+            }
+            if s == "300000" { return .allowed }
+            return .blocked("Befehl \(s) ist nicht freigegeben")
         }
-        if s.hasPrefix("21") || s.hasPrefix("22") {
-            guard mode.allowsDiagnosticReads else {
-                return .blocked("Diagnoseanfrage im Adapter-only-Modus gesperrt")
-            }
-            return mfdReads.contains(s) ? .allowed : .blocked("\(s) ist nicht in der Allowlist")
+
+        // adapter-only / simulation: identification and formatting only
+        if s.hasPrefix("21") || s.hasPrefix("22") || s == "300000" {
+            return .blocked("Diagnoseanfrage im Adapter-only-Modus gesperrt")
         }
-        if s == "300000" {
-            guard mode.allowsDiagnosticReads else {
-                return .blocked("Flow-Control im Adapter-only-Modus gesperrt")
-            }
-            return .allowed
+        if adapterOnlyCommands.contains(s) { return .allowed }
+        if s.range(of: atPattern, options: .regularExpression) != nil {
+            return .blocked("\(s) ist im Adapter-only-Modus nicht freigegeben "
+                            + "(Protokoll-/Adresskonfiguration nur im Fahrzeugmodus)")
         }
         return .blocked("Befehl \(s) ist nicht freigegeben")
     }
@@ -160,6 +181,10 @@ final class SimulatedAdapter: AdapterTransport {
         case command.hasPrefix("AT@"): reply = "OBD SOLUTIONS LLC"
         case command == "ATRV": reply = "12.6V"
         case command == "22F187": reply = "62 F1 87 32 35 39 31 35 36 32 34 34 52"
+        // Synthetic value: 0x38 is the PRE-activation configuration of the
+        // reference vehicle, kept only so the pipeline has something to read.
+        // The documented value after the 2026-11-08 activation is 0x78; this
+        // simulation must never be quoted as a vehicle measurement.
         case command == "226C1C": reply = "62 6C 1C 38"
         case command.hasPrefix("AT"), command.hasPrefix("ST"): reply = "OK"
         default: reply = "?"
@@ -253,16 +278,26 @@ final class SecuredBridge {
     let mode: BridgeMode
     let transport: AdapterTransport
     let vehicleToken: String?
+    let verbose: Bool
 
     private var listenFD: Int32 = -1
     private var adapterName = ""
     private var stnName = ""
 
-    init(socketPath: String, mode: BridgeMode, transport: AdapterTransport, vehicleToken: String?) {
+    init(socketPath: String, mode: BridgeMode, transport: AdapterTransport,
+         vehicleToken: String?, verbose: Bool = false) {
         self.socketPath = socketPath
         self.mode = mode
         self.transport = transport
         self.vehicleToken = vehicleToken
+        self.verbose = verbose
+    }
+
+    /// One line per command actually handed to the adapter. Tests read this to
+    /// prove what the bridge sends on its own, and what a client got through.
+    private func logTx(_ command: String) {
+        guard verbose else { return }
+        note("tx: \(command)")
     }
 
     func identify() throws {
@@ -272,6 +307,7 @@ final class SecuredBridge {
             if case .blocked(let reason) = Gate.check(cmd, mode: mode) {
                 throw TransportError.io("identity command \(cmd) blocked: \(reason)")
             }
+            logTx(cmd)
             try transport.write(cmd + "\r")
             let answer = try transport.waitForLine(timeout: 2.0)
             switch cmd {
@@ -365,6 +401,7 @@ final class SecuredBridge {
                     send(["type": "blocked", "reason": reason])
                 case .allowed:
                     do {
+                        logTx(data.trimmingCharacters(in: .whitespacesAndNewlines))
                         try transport.write(data.hasSuffix("\r") ? data : data + "\r")
                         send(["type": "ok"])
                     } catch {
