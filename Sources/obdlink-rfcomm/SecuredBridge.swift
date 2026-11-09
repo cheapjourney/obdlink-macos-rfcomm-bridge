@@ -53,9 +53,16 @@ struct Gate {
         + "ATFCSM[0-2]|ATAL|ATI|STI|STDI|ATDP|ATRV|ATSH [0-9A-F]{3,8}|ATCRA [0-9A-F]{3,8}|"
         + "STP 33|STCAF 0|STCFCPA [0-9A-F]{3,8}, ?[0-9A-F]{3,8}|ATAT0|STPTO [0-9]{1,5})$"
 
-    /// Read requests permitted in vehicle mode. Subset of phase3's MFD entry.
+    /// Read requests permitted in vehicle mode.
+    ///
+    /// The Swift gate is deliberately the NARROWER side: it may only allow a
+    /// subset of what phase4_1/transport/bridge_gate.py allows, never more.
+    /// 2106 was missing here while the Python side already allowed it, so the
+    /// release for a single 21 06 read was refused by the bridge - narrower is
+    /// safe, but an unintended gap blocks an approved read. Keep every entry
+    /// both sides agree on in the parity corpus.
     static let mfdReads: Set<String> = [
-        "22F187", "22F18E", "21EF", "2180", "226C14", "226C15", "226C1C", "226C20",
+        "22F187", "22F18E", "21EF", "2180", "2106", "226C14", "226C15", "226C1C", "226C20",
     ]
 
     static let adapterIdentityCommands = ["ATI", "STDI", "STI"]
