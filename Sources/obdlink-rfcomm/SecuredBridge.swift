@@ -128,16 +128,27 @@ final class LineBuffer {
     }
 
     /// Next complete line (terminated by CR or LF), without the terminator.
+    ///
+    /// Everything up to AND INCLUDING the terminator is consumed. Removing only
+    /// the terminator (idx..<idx+1) instead of startIndex..<idx+1 leaves the line
+    /// in the buffer, so every later read returns the whole session concatenated
+    /// without delimiters. Measured against the real MX+ burst
+    /// "ATI\rELM327 v1.4b\r\r>": 41 54 49 0D 45 4C 4D 33 32 37 20 76 31 2E 34 62
+    /// 0D 0D 3E must split into "ATI" / "ELM327 v1.4b" / "" and leave nothing.
+    ///
+    /// The ELM prompt ">" is sent WITHOUT a trailing CR, so it is not a line. It
+    /// is consumed here as a response terminator; otherwise it prefixes the next
+    /// answer ("&gt;ATI") and the identification parse sees a glued string.
     func popLine() -> String? {
         lock.lock(); defer { lock.unlock() }
+        while buffer.first == 0x3E { buffer.removeFirst() }
+        guard !buffer.isEmpty else { return nil }
         guard let idx = buffer.firstIndex(where: { $0 == 0x0D || $0 == 0x0A }) else { return nil }
-        let line = buffer.prefix(upTo: idx)
-        var cut = buffer.startIndex..<buffer.endIndex
-        cut = idx..<idx + 1
-        buffer.removeSubrange(cut)
+        let line = String(data: Data(buffer[buffer.startIndex..<idx]), encoding: .ascii) ?? ""
+        buffer.removeSubrange(buffer.startIndex..<idx + 1)
         // drop a following LF of a CRLF pair
         if buffer.first == 0x0A { buffer.removeFirst() }
-        return String(data: line, encoding: .ascii) ?? ""
+        return line
     }
 
     var partial: String {
@@ -216,6 +227,7 @@ final class RfcommTransport: NSObject, AdapterTransport, IOBluetoothRFCOMMChanne
     private let cond = NSCondition()
     private var channel: IOBluetoothRFCOMMChannel?
     private(set) var isClosed = false
+    var verbose = false
 
     func open(address: String, channel channelID: UInt8) -> Bool {
         guard let dev = IOBluetoothDevice(addressString: address) else {
@@ -224,10 +236,15 @@ final class RfcommTransport: NSObject, AdapterTransport, IOBluetoothRFCOMMChanne
         note("device: \(dev.name ?? "?") paired=\(dev.isPaired())")
         if !dev.isConnected() {
             let rc = dev.openConnection()
+            note("baseband connect rc=\(rc)")
             guard rc == kIOReturnSuccess else {
-                note("baseband connect rc=\(rc)"); note("baseband connection failed"); return false
+                note("baseband connection failed"); return false
             }
+            // Same settle delay as the TCP path in main.swift: the MX+ needs a
+            // moment after the baseband link before SPP answers.
+            Thread.sleep(forTimeInterval: 0.8)
         }
+        guard dev.isConnected() else { note("baseband connection failed - device not connected"); return false }
         var ch: IOBluetoothRFCOMMChannel? = nil
         let rc = dev.openRFCOMMChannelSync(&ch, withChannelID: BluetoothRFCOMMChannelID(channelID), delegate: self)
         guard rc == kIOReturnSuccess, let opened = ch else {
@@ -242,32 +259,33 @@ final class RfcommTransport: NSObject, AdapterTransport, IOBluetoothRFCOMMChanne
         guard let ch = channel else { throw TransportError.closed }
         var bytes = Array(text.utf8)
         let rc = ch.writeSync(&bytes, length: UInt16(bytes.count))
+        if verbose { note("writeSync \(rc) for \(bytes.count) bytes") }
         if rc != kIOReturnSuccess { throw TransportError.io("writeSync rc=\(rc)") }
     }
 
+    /// Polls the buffer. IOBluetooth delivers delegate callbacks through the
+    /// run loop of the thread that opened the channel, so waiting on a
+    /// condition here would block exactly the loop that has to deliver them.
     func waitForLine(timeout: Double) throws -> String {
-        cond.lock()
         let deadline = Date().addingTimeInterval(timeout)
-        while true {
-            if let line = lines.popLine() { cond.unlock(); return line }
-            if isClosed { cond.unlock(); throw TransportError.closed }
-            if !cond.wait(until: deadline) {
-                let partial = lines.partial
-                cond.unlock()
-                throw TransportError.timeout(partial: partial)
-            }
+        while Date() < deadline {
+            if let line = lines.popLine() { return line }
+            if isClosed { throw TransportError.closed }
+            Thread.sleep(forTimeInterval: 0.01)
         }
+        if let line = lines.popLine() { return line }
+        if isClosed { throw TransportError.closed }
+        throw TransportError.timeout(partial: lines.partial)
     }
 
     func rfcommChannelData(_ ch: IOBluetoothRFCOMMChannel!, data dataPointer: UnsafeMutableRawPointer!, length dataLength: Int) {
-        cond.lock()
+        if verbose { note("rx \(dataLength) bytes") }
         lines.append(Data(bytes: dataPointer, count: dataLength))
-        cond.broadcast()
-        cond.unlock()
     }
 
     func rfcommChannelClosed(_ ch: IOBluetoothRFCOMMChannel!) {
-        cond.lock(); isClosed = true; cond.broadcast(); cond.unlock()
+        note("RFCOMM channel closed by peer")
+        isClosed = true
     }
 }
 
@@ -283,6 +301,7 @@ final class SecuredBridge {
     private var listenFD: Int32 = -1
     private var adapterName = ""
     private var stnName = ""
+    private var identified = false
 
     init(socketPath: String, mode: BridgeMode, transport: AdapterTransport,
          vehicleToken: String?, verbose: Bool = false) {
@@ -300,23 +319,59 @@ final class SecuredBridge {
         note("tx: \(command)")
     }
 
+    /// Runs on the client thread, after the main run loop is pumping — the
+    /// RFCOMM callbacks can only arrive then.
+    func ensureIdentified() throws {
+        guard !identified else { return }
+        try identify()
+        identified = true
+    }
+
     func identify() throws {
-        // Adapter-local queries only. In adapter-only mode these are the only
-        // frames this program ever sends on its own.
+        // Adapter-local queries only. The adapter echoes by default (we do not
+        // send ATE0 - it is not needed for identification), so a raw line can be
+        // "ATI" followed by the answer on the next line, or both glued together.
+        // Both forms are handled, and the echo is never reported as an answer.
         for cmd in ["ATI", "STDI", "STI"] {
             if case .blocked(let reason) = Gate.check(cmd, mode: mode) {
                 throw TransportError.io("identity command \(cmd) blocked: \(reason)")
             }
             logTx(cmd)
             try transport.write(cmd + "\r")
-            let answer = try transport.waitForLine(timeout: 2.0)
+            let answer = try answer(for: cmd, timeout: 2.0)
             switch cmd {
-            case "ATI": adapterName = answer
-            case "STDI": if !answer.isEmpty { adapterName = answer }
-            case "STI": stnName = answer
-            default: break
+            case "ATI":
+                adapterName = answer
+            case "STDI":
+                if !answer.isEmpty { adapterName = answer }
+            case "STI":
+                stnName = answer
+            default:
+                break
             }
         }
+        if adapterName.isEmpty || stnName.isEmpty {
+            throw TransportError.io("adapter did not identify (adapter=\(adapterName) stn=\(stnName))")
+        }
+    }
+
+    /// Reads the first line that is neither the echoed command nor the prompt.
+    private func answer(for cmd: String, timeout: Double) throws -> String {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let remaining = max(0.05, deadline.timeIntervalSinceNow)
+            let raw = try transport.waitForLine(timeout: remaining)
+            var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty || text == ">" { continue }
+            let upper = text.uppercased()
+            if upper == cmd { continue }                       // pure echo
+            if upper.hasPrefix(cmd) {                          // echo glued to answer
+                text = String(text.dropFirst(cmd.count)).trimmingCharacters(in: .whitespaces)
+                if text.isEmpty { continue }
+            }
+            return text
+        }
+        return ""
     }
 
     func run() -> Never {
@@ -351,11 +406,25 @@ final class SecuredBridge {
         print("READY \(socketPath) mode=\(mode.rawValue) simulated=\(mode.isSimulated)")
         fflush(stdout)
 
+        // The accept loop must NOT run on the main thread: IOBluetooth delivers
+        // RFCOMM delegate callbacks through the run loop of the thread that
+        // opened the channel. With the main thread blocked in accept(), no
+        // callback ever fires and the adapter looks silent (writeSync returns 0,
+        // zero bytes arrive). So: accept on a background thread, keep the main
+        // run loop pumping.
+        let acceptThread = Thread { [self] in
+            while true {
+                let client = accept(listenFD, nil, nil)
+                if client < 0 { continue }
+                handle(client: client)
+                close(client)
+            }
+        }
+        acceptThread.stackSize = 512 * 1024
+        acceptThread.start()
+
         while true {
-            let client = accept(listenFD, nil, nil)
-            if client < 0 { continue }
-            handle(client: client)
-            close(client)
+            RunLoop.current.run(until: Date().addingTimeInterval(3600))
         }
     }
 
@@ -388,6 +457,12 @@ final class SecuredBridge {
             guard let expected = vehicleToken, (hello["vehicle_token"] as? String) == expected else {
                 send(["type": "error", "reason": "token missing"]); return
             }
+        }
+        do {
+            try ensureIdentified()
+        } catch {
+            send(["type": "error", "reason": "adapter identification failed"])
+            return
         }
         send(["type": "hello_ack", "protocol": 1, "adapter": adapterName,
               "stn": stnName, "mode": mode.wireMode, "simulated": mode.isSimulated])

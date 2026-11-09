@@ -258,7 +258,21 @@ func runSelfTest(port: UInt16) -> Never {
         report.check("client receives payload", response.hasPrefix("ELM327"), response)
     }
 
-    // 5. close and verify the port is released
+    // 5. line assembly against a real measured adapter burst.
+    //    An MX+ answers "ATI\r" with echo, answer, blank line and prompt in ONE
+    //    RFCOMM chunk: 41 54 49 0D 45 4C 4D 33 32 37 ... 0D 0D 3E. Splitting that
+    //    chunk is what the bridge's line reader has to get right.
+    let burst: [UInt8] = [0x41, 0x54, 0x49, 0x0D, 0x45, 0x4C, 0x4D, 0x33, 0x32,
+                          0x37, 0x20, 0x76, 0x31, 0x2E, 0x34, 0x62, 0x0D, 0x0D, 0x3E]
+    let lb = LineBuffer()
+    lb.append(Data(burst))
+    var got: [String] = []
+    while let line = lb.popLine() { got.append(line) }
+    report.check("line buffer splits real MX+ burst",
+                 got == ["ATI", "ELM327 v1.4b", ""] && lb.partial.isEmpty,
+                 got.joined(separator: "|") + " / left=\(lb.partial.debugDescription)")
+
+    // 6. close and verify the port is released
     if serverFD >= 0 { close(serverFD) }
     close(client)
     close(listener.fd)
@@ -340,6 +354,7 @@ if let socketPath = cfg.unixSocket {
         transport = SimulatedAdapter()
     } else {
         let rfcomm = RfcommTransport()
+        rfcomm.verbose = cfg.verbose
         guard rfcomm.open(address: normaliseAddress(cfg.address), channel: cfg.channel) else {
             fail("RFCOMM channel \(cfg.channel) open failed", code: 5)
         }
@@ -348,11 +363,6 @@ if let socketPath = cfg.unixSocket {
     let bridge = SecuredBridge(socketPath: socketPath, mode: cfg.mode,
                                transport: transport, vehicleToken: cfg.vehicleToken,
                                verbose: cfg.verbose)
-    do {
-        try bridge.identify()
-    } catch {
-        fail("adapter identification failed: \(error)", code: 5)
-    }
     signal(SIGPIPE, SIG_IGN)
     // remove the socket on the way out - a stale node would block the next start
     var sources: [DispatchSourceSignal] = []
