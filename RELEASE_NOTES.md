@@ -111,5 +111,7 @@ für die Lifecycle-, Golden-, Python-Bridge- oder Parser-Suiten.
 ## Nicht enthalten
 
 - Keine allgemeine Fahrzeug- oder Diagnosekompatibilität.
+- Die Bridge ist eine **Transportkomponente**, keine Diagnose-Engine. Die
+  ISO-TP-Reassemblierung erfolgt im Python-Diagnoseclient, nicht in der Bridge.
 - Keine Android-Auto-/CarPlay-Aktivierung und keine Projektionsaussage.
 - Keine proprietäre Firmware, DDT-Datenbank oder privaten Rohdaten.
