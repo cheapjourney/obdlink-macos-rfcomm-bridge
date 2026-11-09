@@ -62,7 +62,7 @@ struct Gate {
     /// safe, but an unintended gap blocks an approved read. Keep every entry
     /// both sides agree on in the parity corpus.
     static let mfdReads: Set<String> = [
-        "22F187", "22F18E", "21EF", "2180", "2106", "226C14", "226C15", "226C1C", "226C20",
+        "22F187", "22F18E", "21EF", "2180", "2106", "2107", "226C14", "226C15", "226C1C", "226C20",
     ]
 
     static let adapterIdentityCommands = ["ATI", "STDI", "STI"]
