@@ -272,7 +272,23 @@ func runSelfTest(port: UInt16) -> Never {
                  got == ["ATI", "ELM327 v1.4b", ""] && lb.partial.isEmpty,
                  got.joined(separator: "|") + " / left=\(lb.partial.debugDescription)")
 
-    // 6. close and verify the port is released
+    // 6. multi-line diagnostic answer delivered across RFCOMM chunk boundaries.
+    //    A 26-byte identification record does not arrive as one read: the measured
+    //    STI answer came in 1/3/3/15-byte chunks, so a line can start in one chunk
+    //    and end in the next. Nothing may be glued or truncated.
+    let mb = LineBuffer()
+    mb.append(Data("76D 0: 61 80 41\r76D 1: 42 43 4".utf8))
+    let firstThree = mb.popLine()                       // line 1 complete
+    mb.append(Data("4\r76D 2: 45 46\r".utf8))           // rest of line 2 + line 3
+    var rest: [String] = []
+    while let line = mb.popLine() { rest.append(line) }
+    let multi = ([firstThree].compactMap { $0 }) + rest
+    report.check("line buffer rejoins a split multi-frame answer",
+                 multi == ["76D 0: 61 80 41", "76D 1: 42 43 44", "76D 2: 45 46"]
+                    && mb.partial.isEmpty,
+                 multi.joined(separator: "|"))
+
+    // 7. close and verify the port is released
     if serverFD >= 0 { close(serverFD) }
     close(client)
     close(listener.fd)
