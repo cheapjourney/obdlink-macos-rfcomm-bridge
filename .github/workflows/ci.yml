@@ -1,0 +1,32 @@
+name: build-and-selftest
+
+on:
+  push:
+    branches: [ main, integration/phase5.1, "fix/**" ]
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sw_vers
+          swiftc --version
+      - name: Debug build and self-test
+        run: |
+          make build
+          ./build/obdlink-rfcomm --self-test
+      - name: Release build and self-test
+        run: |
+          make clean
+          make build
+          ./build/obdlink-rfcomm --self-test
+      - name: Legacy TCP is opt-in
+        run: |
+          if ./build/obdlink-rfcomm --address AA-BB-CC-DD-EE-FF; then
+            echo "legacy TCP started without --tcp"; exit 1
+          else
+            echo "correctly refused (exit $?)"
+          fi

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Start the bridge and expose it as a pseudo-terminal.
 #
+# Legacy TCP/PTY helper. Since v0.2.0 the bridge requires the explicit --tcp
+# opt-in; this script supplies it below. The secured Unix-socket mode is the
+# recommended operating mode and is not launched by this helper.
+#
 #   adapter --Bluetooth--> RFCOMM --obdlink-rfcomm--> 127.0.0.1:<port>
 #                                                          |
 #                                              socat -> $PTY_LINK
@@ -44,7 +48,7 @@ if [[ -f "$RUN_DIR/bridge.pid" ]] && kill -0 "$(cat "$RUN_DIR/bridge.pid")" 2>/d
 fi
 
 : > "$LOG"
-"$BIN" --address "$ADDRESS" --port "$PORT" --channel "$CHANNEL" >>"$LOG" 2>&1 &
+"$BIN" --tcp --address "$ADDRESS" --port "$PORT" --channel "$CHANNEL" >>"$LOG" 2>&1 &
 echo $! > "$RUN_DIR/bridge.pid"
 
 for _ in $(seq 1 40); do

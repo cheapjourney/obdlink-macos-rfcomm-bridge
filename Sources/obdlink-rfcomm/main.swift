@@ -25,6 +25,12 @@ struct Config {
     var verbose = false
     var selfTest = false
     var showHelp = false
+    // phase 4.1 secured mode (additive; without --unix-socket nothing changes)
+    var unixSocket: String? = nil
+    var mode: BridgeMode = .adapterOnly
+    var vehicleToken: String? = nil
+    var simulateTransport = false
+    var enableTCP = false
 }
 
 let usage = """
@@ -41,13 +47,28 @@ OPTIONS
   -p, --port <n>          TCP port to listen on, 127.0.0.1 only (default 35100)
                           (also read from $OBDLINK_PORT)
   -c, --channel <n>       RFCOMM channel, 1-30 (default 1)
+      --tcp               enable the legacy raw TCP/PTY relay (opt-in since 0.2.0)
   -v, --verbose           log connection detail to stderr
       --self-test         run loopback/TCP tests without Bluetooth and exit
+
+SECURED MODE (phase 4.1, Unix socket + newline-delimited JSON)
+      --unix-socket <path>  serve the JSON protocol on this socket instead of raw TCP
+      --mode <m>            simulation | adapter-only | vehicle-readonly
+                            (default adapter-only; fixed for the process lifetime)
+      --simulate            shorthand for --mode simulation (fake adapter, no Bluetooth)
+      --vehicle-token <t>   required in vehicle-readonly; must match the client's token
+      --simulate-transport  test-only: fake adapter with a real gate (no Bluetooth)
+
+In secured mode the raw TCP listener is NOT started, so it cannot bypass the
+command gate. Socket directory 0700, socket 0600.
+
   -h, --help              show this help
 
 EXIT CODES
   0 success   2 bad usage   3 device not found   4 baseband connect failed
-  5 RFCOMM channel open failed   6 TCP bind/listen failed   75 SPP channel closed
+  5 RFCOMM channel open failed   6 local socket/IO failed   7 another instance holds
+  the socket lock   8 socket path refused (not a socket / not owned / unsafe dir)
+  75 SPP channel closed (legacy TCP path only)
 
 The TCP listener is bound to 127.0.0.1 and is not reachable from the network.
 """
@@ -85,6 +106,17 @@ func parseConfig(_ argv: [String]) -> Config {
             let raw = value(arg)
             guard let v = UInt8(raw), v >= 1, v <= 30 else { fail("invalid channel: \(raw)", code: 2) }
             cfg.channel = v
+        case "--unix-socket": cfg.unixSocket = value(arg)
+        case "--mode":
+            let raw = value(arg)
+            guard let m = BridgeMode(rawValue: raw) else {
+                fail("invalid mode: \(raw) (simulation|adapter-only|vehicle-readonly)", code: 2)
+            }
+            cfg.mode = m
+        case "--simulate": cfg.mode = .simulation
+        case "--simulate-transport": cfg.simulateTransport = true
+        case "--tcp": cfg.enableTCP = true
+        case "--vehicle-token": cfg.vehicleToken = value(arg)
         case "-v", "--verbose": cfg.verbose = true
         case "--self-test": cfg.selfTest = true
         case "-h", "--help": cfg.showHelp = true
@@ -231,7 +263,59 @@ func runSelfTest(port: UInt16) -> Never {
         report.check("client receives payload", response.hasPrefix("ELM327"), response)
     }
 
-    // 5. close and verify the port is released
+    // 5. line assembly against a real measured adapter burst.
+    //    An MX+ answers "ATI\r" with echo, answer, blank line and prompt in ONE
+    //    RFCOMM chunk: 41 54 49 0D 45 4C 4D 33 32 37 ... 0D 0D 3E. Splitting that
+    //    chunk is what the bridge's line reader has to get right.
+    let burst: [UInt8] = [0x41, 0x54, 0x49, 0x0D, 0x45, 0x4C, 0x4D, 0x33, 0x32,
+                          0x37, 0x20, 0x76, 0x31, 0x2E, 0x34, 0x62, 0x0D, 0x0D, 0x3E]
+    let lb = LineBuffer()
+    lb.append(Data(burst))
+    var got: [String] = []
+    while let line = lb.popLine() { got.append(line) }
+    report.check("line buffer splits real MX+ burst",
+                 got == ["ATI", "ELM327 v1.4b", ""] && lb.partial.isEmpty,
+                 got.joined(separator: "|") + " / left=\(lb.partial.debugDescription)")
+
+    // 6. multi-line diagnostic answer delivered across RFCOMM chunk boundaries.
+    //    A 26-byte identification record does not arrive as one read: the measured
+    //    STI answer came in 1/3/3/15-byte chunks, so a line can start in one chunk
+    //    and end in the next. Nothing may be glued or truncated.
+    let mb = LineBuffer()
+    mb.append(Data("76D 0: 61 80 41\r76D 1: 42 43 4".utf8))
+    let firstThree = mb.popLine()                       // line 1 complete
+    mb.append(Data("4\r76D 2: 45 46\r".utf8))           // rest of line 2 + line 3
+    var rest: [String] = []
+    while let line = mb.popLine() { rest.append(line) }
+    let multi = ([firstThree].compactMap { $0 }) + rest
+    report.check("line buffer rejoins a split multi-frame answer",
+                 multi == ["76D 0: 61 80 41", "76D 1: 42 43 44", "76D 2: 45 46"]
+                    && mb.partial.isEmpty,
+                 multi.joined(separator: "|"))
+
+    // 7. a 295-byte dump arrives as 43 lines; they must survive RFCOMM chunking.
+    //    This is the shape 21 7F would have on the wire, delivered in three
+    //    uneven chunks that cut through the middle of lines.
+    let dumpText = (0..<43).map { String(format: "76D %02X 11 22 33 44 55 66 77\r", $0) }.joined()
+    let dumpBytes = Array(dumpText.utf8)
+    let lb43 = LineBuffer()
+    var got43: [String] = []
+    var from = 0
+    for cut in [dumpBytes.count / 3, (dumpBytes.count * 2) / 3, dumpBytes.count] {
+        lb43.append(Data(dumpBytes[from..<cut]))
+        from = cut
+        while let line = lb43.popLine() { got43.append(line) }
+    }
+    report.check("line buffer handles a 43-frame answer split in 3 chunks",
+                 got43.count == 43 && lb43.partial.isEmpty
+                    && got43.first == "76D 00 11 22 33 44 55 66 77"
+                    && got43.last == "76D 2A 11 22 33 44 55 66 77",
+                 "\(got43.count) lines")
+
+    // 8. secured-mode socket lifecycle (ownership, locking, stale detection)
+    runSocketLifecycleSelfTests(&report)
+
+    // 9. close and verify the port is released
     if serverFD >= 0 { close(serverFD) }
     close(client)
     close(listener.fd)
@@ -253,8 +337,11 @@ final class Relay: NSObject, IOBluetoothRFCOMMChannelDelegate {
 
     init(verbose: Bool) { self.verbose = verbose }
 
-    func attach(_ fd: Int32) {
-        lock.lock(); clientFD = fd; lock.unlock()
+    func attach(_ fd: Int32) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard clientFD < 0 else { return false }   // legacy relay: one client at a time
+        clientFD = fd
+        return true
     }
 
     func detach() {
@@ -299,8 +386,58 @@ if cfg.selfTest {
     runSelfTest(port: cfg.port)
 }
 
+// MARK: secured mode (phase 4.1) - takes precedence, never starts the TCP relay
+
+if let socketPath = cfg.unixSocket {
+    if cfg.mode != .simulation && !cfg.simulateTransport && cfg.address.isEmpty {
+        fail("--address is required unless the transport is simulated", code: 2)
+    }
+    if cfg.mode == .vehicleReadonly, (cfg.vehicleToken ?? "").isEmpty {
+        fail("--vehicle-token is required in vehicle-readonly mode", code: 2)
+    }
+    let transport: AdapterTransport
+    if cfg.mode == .simulation || cfg.simulateTransport {
+        transport = SimulatedAdapter()
+    } else {
+        let rfcomm = RfcommTransport()
+        rfcomm.verbose = cfg.verbose
+        guard rfcomm.open(address: normaliseAddress(cfg.address), channel: cfg.channel) else {
+            fail("RFCOMM channel \(cfg.channel) open failed", code: 5)
+        }
+        transport = rfcomm
+    }
+    let bridge = SecuredBridge(socketPath: socketPath, mode: cfg.mode,
+                               transport: transport, vehicleToken: cfg.vehicleToken,
+                               verbose: cfg.verbose)
+    signal(SIGPIPE, SIG_IGN)
+    // remove the socket on the way out - a stale node would block the next start
+    var sources: [DispatchSourceSignal] = []
+    let signalQueue = DispatchQueue(label: "obdlink-rfcomm.signals")
+    for sig in [SIGINT, SIGTERM] {
+        signal(sig, SIG_IGN)
+        // own queue: the main thread is blocked in accept() and never runs a loop
+        let src = DispatchSource.makeSignalSource(signal: sig, queue: signalQueue)
+        src.setEventHandler {
+            bridge.cleanup()
+            FileHandle.standardError.write("bridge stopped\n".data(using: .utf8)!)
+            exit(0)
+        }
+        src.resume()
+        sources.append(src)
+    }
+    _ = sources   // keep alive for the process lifetime
+    bridge.run()
+}
+
 guard !cfg.address.isEmpty else {
     fail("no Bluetooth address given\n\n\(usage)", code: 2)
+}
+// Since v0.2.0 the legacy TPC/PTY relay is opt-in: it has no command gate and
+// only one client slot, so it must never start just because an address was
+// given. The secured Unix socket is the recommended path.
+guard cfg.enableTCP else {
+    fail("legacy TCP/PTY mode is disabled by default since v0.2.0; "
+         + "use --unix-socket <path> (recommended) or pass --tcp explicitly", code: 2)
 }
 let deviceAddress = normaliseAddress(cfg.address)
 
@@ -344,7 +481,11 @@ Thread.detachNewThread {
     while true {
         let client = accept(listener.fd, nil, nil)
         if client < 0 { usleep(100_000); continue }
-        relay.attach(client)
+        guard relay.attach(client) else {
+            note("rejected client: legacy relay serves one client at a time")
+            close(client)
+            continue
+        }
         note("client connected from \(peerDescription(client))")
 
         Thread.detachNewThread {

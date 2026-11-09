@@ -1,11 +1,24 @@
 # obdlink-macos-rfcomm-bridge
 
-Expose a Bluetooth SPP adapter (OBDLink MX+, STN-based, ELM327-compatible) as a
-loopback TCP socket and a pseudo-terminal on macOS — without relying on the
-`/dev/cu.*` device that macOS creates for it.
+Expose a Bluetooth SPP adapter (OBDLink MX+, STN-based, ELM327-compatible) on
+macOS without relying on the persisted `/dev/cu.*` device. The bridge has two
+separate operating paths:
+
+- a secured Unix-domain socket speaking newline-delimited JSON (recommended
+  since v0.2.0), and
+- the legacy loopback TCP/PTY relay, which is available only with the explicit
+  `--tcp` opt-in and has no command gate.
+
+The legacy transport looks like this:
 
 ```
 adapter --Bluetooth--> RFCOMM --obdlink-rfcomm--> 127.0.0.1:35100 --> socat PTY --> /tmp/obdlink
+```
+
+The secured path does not start the TCP listener:
+
+```
+adapter --Bluetooth--> RFCOMM --obdlink-rfcomm--> Unix socket + NDJSON v1
 ```
 
 ## Why this exists
@@ -13,29 +26,27 @@ adapter --Bluetooth--> RFCOMM --obdlink-rfcomm--> 127.0.0.1:35100 --> socat PTY 
 macOS creates a persistent `/dev/cu.<DeviceName>-SerialPort` node for a paired
 classic-Bluetooth SPP device. In practice that node can stop working after the
 first session: `open()` returns a file descriptor in milliseconds, `read()`
-returns nothing, and `bluetoothd` never logs a connection attempt — no ACL
-request, no RFCOMM request, nothing. The device itself is fine (it answers
-normally over RFCOMM), but the persisted port object no longer initiates
-connections.
+returns nothing, and `bluetoothd` never logs a connection attempt. The device is
+fine and answers normally over RFCOMM, but the persisted port object no longer
+initiates connections.
 
 `obdlink-rfcomm` bypasses that layer. It opens the RFCOMM channel directly
-through `IOBluetooth`, keeps it open, and relays bytes to a TCP socket bound to
-`127.0.0.1`. A small `socat` PTY then makes the byte stream look like an ordinary
-serial device, so existing `pyserial` code works unchanged.
+through `IOBluetooth`, keeps it open, and relays bytes to either the secured
+Unix socket or the opt-in legacy TCP/PTY path.
 
 ## Requirements
 
 - macOS 10.13 or newer (developed on 12.7.6, Intel)
 - Xcode Command Line Tools (`xcode-select --install`) for `swiftc`
-- `socat` for the PTY layer (`brew install socat`)
+- `socat` only if you use the legacy TCP/PTY path (`brew install socat`)
 - The adapter paired with the Mac through **System Settings → Bluetooth**
 
-Pairing is manual by design. Most adapters only become discoverable after you
+Pairing is manual by design. Most adapters become discoverable only after you
 press their physical pairing button and hold it until the LED blinks quickly.
 
 ### Tested environment
 
-Everything in the "Test results" section below was measured on exactly this setup:
+The hardware and adapter results below were measured on exactly this setup:
 
 | Component | Version |
 |---|---|
@@ -55,20 +66,61 @@ make            # builds build/obdlink-rfcomm
 make test       # runs the hardware-free self-test
 ```
 
-Or directly:
+A direct build must include every Swift source file, not only `main.swift`:
 
 ```bash
-swiftc -O Sources/obdlink-rfcomm/main.swift -o build/obdlink-rfcomm
+swiftc -O Sources/obdlink-rfcomm/*.swift -o build/obdlink-rfcomm
 ```
 
-## Usage
+## Modes and usage
 
-### 1. Bridge only (TCP)
+### Secured Unix socket (recommended since v0.2.0)
 
 ```bash
-./build/obdlink-rfcomm --address AA-BB-CC-DD-EE-FF
+./build/obdlink-rfcomm \
+  --unix-socket ~/.smart453/obd-bridge.sock \
+  --mode vehicle-readonly \
+  --vehicle-token "$SMART453_VEHICLE_TOKEN" \
+  --address AA-BB-CC-DD-EE-FF
+```
+
+The socket speaks NDJSON v1. It uses a server-side command gate and never starts
+the legacy TCP listener. The mode is fixed for the process lifetime; it cannot
+be upgraded by a later client message.
+
+| Mode | Purpose | Diagnostic reads |
+|---|---|---|
+| `adapter-only` | Adapter identity and formatting only | blocked |
+| `vehicle-readonly` | Adapter setup plus the vehicle-specific read allowlist | only the allowlist |
+| `simulation` | Hardware-free fake adapter for tests | blocked (adapter-only wire mode) |
+
+The allowlist is a **Smart 453-specific profile** documented in
+[`docs/ALLOWLIST.md`](docs/ALLOWLIST.md), not a universal safety filter. The
+`vehicle-readonly` mode also requires a matching `vehicle_token`; the token is a
+local client check, not a signature or a remote authentication scheme.
+
+Socket rules: `0600` inside a `0700` directory, `flock` against a second
+instance (exit 7), and a path that is not a socket owned by the current user is
+refused (exit 8). Cleanup removes only the socket this process created.
+
+### Legacy TCP/PTY relay (v0.1.0-compatible; requires `--tcp`)
+
+The raw relay is **off by default** since v0.2.0. It has no command gate and
+must be enabled explicitly:
+
+```bash
+./build/obdlink-rfcomm --tcp --address AA-BB-CC-DD-EE-FF
 # READY 127.0.0.1:35100
 ```
+
+The listener binds `127.0.0.1` only and serves one client at a time. A second
+client is rejected; it does not displace the first. Treat any client that can
+reach this port as having physical access to the OBD connector.
+
+The legacy TCP/PTY helper scripts are retained for v0.1.0 compatibility:
+`scripts/start.sh` now passes `--tcp` explicitly, and `scripts/verify.sh` uses
+that helper. They remain a raw, un-gated legacy path; the secured Unix-socket
+mode is the recommended operating mode and is not started by these helpers.
 
 Options:
 
@@ -77,151 +129,142 @@ Options:
 | `-a, --address` | `$OBDLINK_ADDRESS` | Bluetooth address, `AA-BB-CC-DD-EE-FF` or colon-separated |
 | `-p, --port` | `35100` | TCP port, bound to `127.0.0.1` only |
 | `-c, --channel` | `1` | RFCOMM channel from the device's SDP record |
+| `--tcp` | off | enable the legacy raw TCP/PTY relay |
+| `--unix-socket` | — | use the secured NDJSON Unix socket instead of TCP |
+| `--mode` | `adapter-only` | secured mode: `simulation`, `adapter-only`, `vehicle-readonly` |
+| `--vehicle-token` | — | required in `vehicle-readonly` |
+| `--simulate` | — | simulation mode; fake adapter, no Bluetooth |
+| `--simulate-transport` | — | test-only fake transport with the real gate |
 | `-v, --verbose` | off | log per-packet detail to stderr |
-| `--self-test` | — | run loopback tests without Bluetooth |
+| `--self-test` | — | run loopback/TCP and lifecycle tests without Bluetooth |
 
-### 2. Bridge + pseudo-terminal (recommended)
+The default mode is not a default vehicle session: without `--unix-socket`,
+`--tcp` or `--self-test`, the process does not start a usable transport and
+exits 2.
 
-```bash
-./scripts/start.sh --address AA-BB-CC-DD-EE-FF
-# bridge ready
-#   tcp : 127.0.0.1:35100 (loopback only)
-#   pty : /tmp/obdlink -> /dev/ttys004
-```
+## Scope and security boundaries
 
-Then talk to it like any serial port:
+The two paths have different security properties and must not be conflated.
 
-```python
-import serial
+### Legacy TCP/PTY path
 
-with serial.Serial("/tmp/obdlink", 115200, timeout=1) as port:
-    port.write(b"ATI\r")
-    print(port.read(64))     # b'ATI\rELM327 v1.4b\r\r>'
-```
+- It is a **raw bidirectional transport**. It does not parse, validate, filter
+  or allowlist commands.
+- It is opt-in with `--tcp`; without that flag it does not start.
+- The listener is loopback-only and accepts one client at a time.
+- The adapter receives exactly what the client writes. There is no command gate,
+  no diagnostic parser and no ECU write protection on this path.
+- CarPlay and Android Auto are not part of this project.
 
-Stop it:
+### Secured Unix-socket path
 
-```bash
-./scripts/stop.sh
-```
+- `adapter-only` permits only adapter identity and formatting commands; `21`/`22`
+  diagnostic requests and protocol/addressing configuration are blocked.
+- `vehicle-readonly` permits adapter setup plus the ten entries in
+  [`docs/ALLOWLIST.md`](docs/ALLOWLIST.md), and `300000` as the only flow-control
+  frame. Session, reset, DTC-clear, write, security-access, routine and
+  memory/flash services are outside the gate.
+- The gate is server-side in the bridge. It is a narrow command filter, not a
+  diagnostic stack, an ECU firewall, a functional safety proof or a universal
+  vehicle-security product.
+- The vehicle profile is specific to the tested Smart 453 EMM/headunit
+  combination. It does not establish compatibility with another vehicle,
+  firmware or adapter.
 
-### 3. Verify the connection
-
-```bash
-./scripts/verify.sh --address AA-BB-CC-DD-EE-FF
-```
-
-Starts the bridge, sends a single `ATI` (adapter identity — this never reaches a
-vehicle bus), checks for the `>` prompt, and stops the bridge again. Exit code 0
-means the adapter answered.
-
-## Scope — read this before using it
-
-This project is a **transport**, nothing more. It moves bytes between a Bluetooth
-SPP adapter and a local TCP socket / PTY.
-
-- **The link is bidirectional.** Any client that connects can send whatever it
-  wants, including vehicle commands. Treat access to the TCP port as equivalent
-  to physical access to the OBD connector.
-- **It is not a diagnostic tool**, not a CAN/UDS library, and **not a safety
-  filter**. It does not parse, validate or allowlist anything.
-- **No vehicle traffic was used in testing.** The only bytes ever sent through
-  this bridge during development were `ATI`, the adapter's own identity query.
-  No CAN request, no UDS/KWP request, no coding, no ECU write was tested with
-  this release — and none is claimed to work.
-- **CarPlay and Android Auto are not part of this project** in any form.
-
-If you need a client that can only issue a fixed set of read requests, enforce
-that in the client. This bridge will not do it for you.
+The bridge does not reassemble ISO-TP. That is done by the Python diagnostic
+client, which must also enforce its own gate. The bridge does not interpret
+diagnostic responses.
 
 ## How it works
 
 1. `IOBluetoothDevice(addressString:)` finds the paired device.
 2. `openConnection()` brings up the baseband link if it is down.
 3. `openRFCOMMChannelSync(withChannelID:delegate:)` opens the SPP channel.
-4. A background thread accepts one TCP client at a time and relays bytes
-   bidirectionally: RFCOMM delegate → client socket, client socket → `writeSync`.
-5. When the client disconnects the RFCOMM channel stays open, so the next client
-   connects without any Bluetooth round trip.
+4. In the secured path, a Unix socket accepts one client at a time and speaks
+   NDJSON v1. In the legacy path, a background thread accepts one TCP client and
+   relays bytes bidirectionally.
+5. The RFCOMM channel stays open across client disconnects; only the local
+   socket/PTY client comes and goes.
 
-## Security model
-
-- The TCP listener binds **`127.0.0.1` only**. It is not reachable from the LAN.
-- One client at a time; a second connection waits until the first closes.
-- No credentials, no pairing state, and no device addresses are stored by this
-  program. The address is supplied at runtime.
-- The program does not send anything on its own. Whatever reaches the adapter is
-  exactly what the client wrote — see **Scope** above: that is a transport
-  property, not a safety guarantee.
+Terminal behaviour on the legacy path: the second client is rejected, not queued.
 
 ## Self-test
 
-`--self-test` exercises the whole TCP path with no Bluetooth hardware and no
-serial port:
+`--self-test` exercises the transport and socket lifecycle without Bluetooth
+hardware or a serial port. The current v0.2.0 baseline is **23/23 checks**:
+TCP bind/accept/relay/port release, line-buffer handling for real MX+ bursts and
+split multi-frame answers, and the secured socket lifecycle (directory 0700,
+second-instance lock, stale/live socket, regular file/symlink refusal,
+permissions and ownership-aware cleanup).
 
-```
-PASS  listener binds  [port 49721]
-PASS  bound to 127.0.0.1 only  [127.0.0.1]
-PASS  client connects
-PASS  accept returns a socket
-PASS  peer address is loopback  [127.0.0.1:49722]
-PASS  client -> bridge write
-PASS  bridge receives payload  [ATI\r]
-PASS  client receives payload  [ELM327 v1.4b\r\r>]
-PASS  port released after close  [re-bound 49721]
-
-9 passed, 0 failed
-```
-
-It verifies bind scope, accept, bidirectional relay, and that the port is
-released afterwards.
+The historical v0.1.0 self-test had **9/9 checks** and covered only the TCP path.
+That number is not the v0.2.0 baseline.
 
 ## Test results
 
-Two different things — do not read the second as a guarantee for your hardware.
+### MacBook offline suites (external, hardware-free)
 
-### Offline tests (no Bluetooth, repeatable on any machine)
+These results were produced on the MacBook build of this candidate; they are not
+a local run on the iMac:
 
-The self-test above is nine checks of the TCP path: bind scope, accept, loopback
-peer, bidirectional relay, port release. It needs no adapter and no paired
-device, so it is reproducible everywhere. Result on the tested environment:
-**9 passed, 0 failed**.
-
-### Live stability (measured once, on the hardware listed above)
-
-| Test | Result |
+| Suite | Result |
 |---|---|
-| Continuous session held open | **300 s**, 30 polls at 10 s intervals, 0 timeouts, 0 drops |
-| Adapter identification during the session | 30/30 `ATI` answered (`ELM327 v1.4b`) |
-| Open/close cycles through the PTY | **10/10** reconnect without a Bluetooth re-connect |
+| Swift self-test | **23/23** |
+| Lifecycle regression | **15/15** |
+| Golden messages | **29/29** |
+| Python bridge integration | **22/22** |
+| Python parser/decoder | **63/63** |
 
-The RFCOMM channel stays open across client reconnects; only the PTY/socket
-client comes and goes. `STI` on the same adapter reported `STN2255 v5.10.3`.
+The GitHub Actions workflow is a separate, narrower check. It builds Debug and
+Release on `macos-latest`, runs the Swift self-test in both builds, and verifies
+that the legacy path refuses to start without `--tcp`. It does **not** run the
+lifecycle, golden, Python bridge or parser/decoder suites. A green CI badge is
+not evidence that all five suites ran there.
 
-These numbers come from a single measurement on one unit. They show that the
-approach works end to end; they are not a promise about throughput, latency or
-long-term stability on other adapters or macOS versions.
+### Limited vehicle validation (2026-11-09, read-only)
 
-### Live verification of this build (v0.1.0)
+One deliberately limited smoke test was performed on the bridge commit
+`da9dc65` with the OBDLink MX+ / STN2255 adapter. The tested binary SHA-256 was
+`f751706a4938d11eaf0911340e35b2cc140e2dbe8982a64f1abc8488006641df`.
 
-`scripts/verify.sh` sends exactly one command — `ATI`, the adapter's own identity
-query, which never reaches a vehicle bus — and was run twice against the same
-adapter with this binary:
+Confirmed:
 
-| Run | Result |
-|---|---|
-| 1 | **PASS** — fresh RFCOMM channel opened, reply `ATI\rELM327 v1.4b\r\r>` |
-| 2 | **PASS** — same reply after the first session had been fully closed |
+- EMM `21 80`: 26-byte response, byte-identical to the earlier baseline.
+- EMM `21 07`: 3-byte response (`61 07 00`), byte-identical to the earlier
+  baseline.
+- Headunit `21 80`: 26-byte response, byte-identical to the historical
+  baseline.
+- Headunit `22 F1 87`: 13-byte identity response, byte-identical to the
+  historical baseline.
+- Headunit `22 6C 1C`: 4-byte response (`62 6C 1C 78`), unchanged from the
+  historical read-back.
 
-After each run: no bridge process, no listener on `127.0.0.1:35100`, no PTY left
-behind. The second run re-opened the baseband link and the RFCOMM channel from
-scratch, so a clean reconnect is confirmed.
+No session request, no write, no configuration change and no routine/security
+access was performed. The vehicle configuration was not modified.
+
+The test is **not** a general compatibility or functional test. It covers only
+the listed reads, that adapter and that commit. Other services, sessions,
+writes, multimedia CAN, other adapters, other firmware and other vehicles are
+untested.
+
+An initial harness run had a client-side response-synchronisation error: a
+`21 07` request was sent with the default header to `0x7E0` and was answered
+negatively with `7E8 03 7F 21 12`. That read-only attempt changed nothing. The
+harness was corrected to use the intended header, and the successful
+measurements above were taken after that correction.
+
+### Historical v0.1.0 live stability
+
+The v0.1.0 release measured 300 s continuous session, 30/30 `ATI` polls and
+10/10 PTY open/close cycles on one OBDLink MX+ unit. These were single-unit
+transport measurements, not a guarantee for other hardware or a vehicle
+compatibility claim.
 
 ## Troubleshooting
 
-See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for the stale `/dev/cu`
+See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for the stale `/dev/cu`
 symptom, permission prompts, port conflicts and exit codes.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [`LICENSE`](LICENSE).
