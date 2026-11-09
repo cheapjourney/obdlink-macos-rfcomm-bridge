@@ -58,6 +58,20 @@ Die GitHub-CI führt **nicht** die Lifecycle-, Golden-, Python-Bridge- oder
 Parser/Decoder-Suiten aus. Ein grüner CI-Status ist daher nur ein Nachweis für
 Build, Selbsttest und den TCP-Opt-in-Negativtest.
 
+## Helferskripte
+
+Die Shell-Helfer werden lokal syntaktisch geprüft:
+
+```bash
+bash -n scripts/start.sh scripts/stop.sh scripts/verify.sh
+```
+
+`scripts/start.sh` ist ein Legacy-TCP/PTY-Helfer und übergibt seit v0.2.0
+ausdrücklich `--tcp`. `scripts/verify.sh` verwendet diesen Helfer. Beide starten
+keinen gesicherten Unix-Socket; der gesicherte Modus bleibt der empfohlene
+Betriebsweg. Ein echter Starttest benötigt macOS und einen Adapter und wurde auf
+dem iMac nicht ausgeführt.
+
 ## Fahrzeugtest
 
 Der separate begrenzte Read-only-Fahrzeugtest ist kein Bestandteil dieser

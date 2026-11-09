@@ -117,10 +117,10 @@ The listener binds `127.0.0.1` only and serves one client at a time. A second
 client is rejected; it does not displace the first. Treat any client that can
 reach this port as having physical access to the OBD connector.
 
-The v0.1.0 helper scripts (`scripts/start.sh`, `scripts/verify.sh`) predate the
-`--tcp` opt-in and do **not** add that flag. They are therefore not a v0.2.0
-launcher as written. Use the direct binary command above, or update those
-helpers separately; this release does not change them.
+The legacy TCP/PTY helper scripts are retained for v0.1.0 compatibility:
+`scripts/start.sh` now passes `--tcp` explicitly, and `scripts/verify.sh` uses
+that helper. They remain a raw, un-gated legacy path; the secured Unix-socket
+mode is the recommended operating mode and is not started by these helpers.
 
 Options:
 

@@ -14,9 +14,9 @@ Prepared: 2026-11-09.
   (adapter-only, vehicle-readonly, simulation).
 - Deterministische Fehlerantworten: `invalid json` und `message too long`
   beenden eine fehlerhafte Verbindung mit einer Nachricht statt mit Stille.
-- Socket-Lebenszyklus: `flock` gegen Doppelstart (Exit 7), Typprüfung des Pfads
-  (Exit 8), Inode-geprüftes Cleanup, Verzeichnis wird nie nachträglich
-  chmod'ed.
+- Socket-Lebenszyklus: `flock` gegen Doppelstart (Exit 7), `O_NOFOLLOW` für die
+  Lock-Datei, Typprüfung des Pfads (Exit 8), Inode-geprüftes Cleanup,
+  Verzeichnis wird nie nachträglich chmod'ed.
 - Selbsttest um Lifecycle-Prüfungen erweitert; aktuelle Baseline **23/23**.
 
 ## Geändert
@@ -26,9 +26,9 @@ Prepared: 2026-11-09.
   Rohpfad hat kein Gate.
 - Der Legacy-Relay nimmt nur noch einen Client gleichzeitig an; ein zweiter wird
   abgewiesen statt den ersten zu verdrängen.
-- Die v0.1.0-Helferskripte `scripts/start.sh` und `scripts/verify.sh` setzen
-  `--tcp` nicht und sind deshalb nicht unverändert als v0.2.0-Launcher
-  verwendbar.
+- Die v0.1.0-Helferskripte `scripts/start.sh` und `scripts/verify.sh` bleiben
+  Legacy-TCP-Helfer; `start.sh` übergibt jetzt ausdrücklich `--tcp`. Der
+  gesicherte Unix-Socket-Modus bleibt der empfohlene Betriebsweg.
 
 ## Sicherheit
 
@@ -102,7 +102,9 @@ für die Lifecycle-, Golden-, Python-Bridge- oder Parser-Suiten.
   universelle Sicherheitsfunktion.
 - Byte-identische Builds sind mit Swift 5.7.2 auf macOS 12.7.6 nicht
   nachgewiesen.
-- Die v0.1.0-Helferskripte sind nicht auf das `--tcp`-Opt-in umgestellt.
+- Die v0.1.0-Helferskripte bleiben auf den ungegateten Legacy-TCP-Pfad
+  beschränkt; `start.sh` übergibt `--tcp` ausdrücklich, startet aber keinen
+  gesicherten Socket.
 - O-1 bis O-3: niedrige lokale Cleanup-Einschränkungen, siehe
   `docs/SECURITY.md`.
 

@@ -27,8 +27,9 @@ tag and release metadata is authoritative for publication state.
    not a universal security function. See `docs/ALLOWLIST.md`.
 4. **Byte-identical builds** — not proven with Swift 5.7.2 on macOS 12.7.6;
    the process is reproducible, not the byte result.
-5. **Legacy helper scripts** — `scripts/start.sh` and `scripts/verify.sh` predate
-   the `--tcp` opt-in and do not add it. They are not v0.2.0 launchers as written.
+5. **Legacy helper scripts** — `scripts/start.sh` and `scripts/verify.sh` are
+   retained for the raw legacy path. `start.sh` now passes `--tcp` explicitly;
+   neither helper starts the secured Unix-socket mode.
 6. **Low-severity cleanup observations O-1 to O-3** — documented in
    `docs/SECURITY.md`; they are local, same-user limitations, not a remote or
    vehicle-safety bypass. They were not code-changed in this documentation

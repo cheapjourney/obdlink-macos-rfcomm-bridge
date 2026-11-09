@@ -16,6 +16,9 @@ This project follows [Semantic Versioning](https://semver.org/).
 ### Changed
 - Legacy TCP/PTY relay is opt-in via `--tcp` (breaking; no gate on that path).
 - Legacy relay rejects a second concurrent client instead of displacing the first.
+- `scripts/start.sh` now passes `--tcp` explicitly for the legacy TCP/PTY path;
+  `scripts/verify.sh` uses that helper. The secured Unix-socket mode remains the
+  recommended path.
 
 ### Security
 - A second instance can no longer delete a running instance's socket.
