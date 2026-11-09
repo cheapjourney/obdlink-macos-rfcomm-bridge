@@ -225,3 +225,24 @@ symptom, permission prompts, port conflicts and exit codes.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## v0.2.0 — secured mode and hardening
+
+The secured Unix-socket mode is the recommended path:
+
+```
+obdlink-rfcomm --unix-socket ~/.smart453/obd-bridge.sock --mode vehicle-readonly \
+               --vehicle-token <token> --address AA-BB-CC-DD-EE-FF
+```
+
+It speaks NDJSON v1 (see `docs/NDJSON.md`), gates every command against a
+vehicle-specific allowlist (`docs/ALLOWLIST.md`) and never starts the raw TCP relay.
+
+**Breaking change:** the legacy TCP/PTY relay now requires `--tcp`. Without it the
+bridge exits 2. The relay has no command gate and serves one client at a time.
+
+Socket rules: `0600` inside a `0700` directory, `flock` against a second instance
+(exit 7), and the path is refused if it is not a socket owned by the current user
+(exit 8). Cleanup removes only the socket this process created.
+
+Self-test: `make build && ./build/obdlink-rfcomm --self-test` (22 checks).

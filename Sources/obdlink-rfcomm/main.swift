@@ -30,6 +30,7 @@ struct Config {
     var mode: BridgeMode = .adapterOnly
     var vehicleToken: String? = nil
     var simulateTransport = false
+    var enableTCP = false
 }
 
 let usage = """
@@ -46,6 +47,7 @@ OPTIONS
   -p, --port <n>          TCP port to listen on, 127.0.0.1 only (default 35100)
                           (also read from $OBDLINK_PORT)
   -c, --channel <n>       RFCOMM channel, 1-30 (default 1)
+      --tcp               enable the legacy raw TCP/PTY relay (opt-in since 0.2.0)
   -v, --verbose           log connection detail to stderr
       --self-test         run loopback/TCP tests without Bluetooth and exit
 
@@ -64,7 +66,9 @@ command gate. Socket directory 0700, socket 0600.
 
 EXIT CODES
   0 success   2 bad usage   3 device not found   4 baseband connect failed
-  5 RFCOMM channel open failed   6 TCP bind/listen failed   75 SPP channel closed
+  5 RFCOMM channel open failed   6 local socket/IO failed   7 another instance holds
+  the socket lock   8 socket path refused (not a socket / not owned / unsafe dir)
+  75 SPP channel closed (legacy TCP path only)
 
 The TCP listener is bound to 127.0.0.1 and is not reachable from the network.
 """
@@ -111,6 +115,7 @@ func parseConfig(_ argv: [String]) -> Config {
             cfg.mode = m
         case "--simulate": cfg.mode = .simulation
         case "--simulate-transport": cfg.simulateTransport = true
+        case "--tcp": cfg.enableTCP = true
         case "--vehicle-token": cfg.vehicleToken = value(arg)
         case "-v", "--verbose": cfg.verbose = true
         case "--self-test": cfg.selfTest = true
@@ -307,7 +312,10 @@ func runSelfTest(port: UInt16) -> Never {
                     && got43.last == "76D 2A 11 22 33 44 55 66 77",
                  "\(got43.count) lines")
 
-    // 8. close and verify the port is released
+    // 8. secured-mode socket lifecycle (ownership, locking, stale detection)
+    runSocketLifecycleSelfTests(&report)
+
+    // 9. close and verify the port is released
     if serverFD >= 0 { close(serverFD) }
     close(client)
     close(listener.fd)
@@ -329,8 +337,11 @@ final class Relay: NSObject, IOBluetoothRFCOMMChannelDelegate {
 
     init(verbose: Bool) { self.verbose = verbose }
 
-    func attach(_ fd: Int32) {
-        lock.lock(); clientFD = fd; lock.unlock()
+    func attach(_ fd: Int32) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard clientFD < 0 else { return false }   // legacy relay: one client at a time
+        clientFD = fd
+        return true
     }
 
     func detach() {
@@ -407,7 +418,7 @@ if let socketPath = cfg.unixSocket {
         // own queue: the main thread is blocked in accept() and never runs a loop
         let src = DispatchSource.makeSignalSource(signal: sig, queue: signalQueue)
         src.setEventHandler {
-            unlink(socketPath)
+            bridge.cleanup()
             FileHandle.standardError.write("bridge stopped\n".data(using: .utf8)!)
             exit(0)
         }
@@ -420,6 +431,13 @@ if let socketPath = cfg.unixSocket {
 
 guard !cfg.address.isEmpty else {
     fail("no Bluetooth address given\n\n\(usage)", code: 2)
+}
+// Since v0.2.0 the legacy TPC/PTY relay is opt-in: it has no command gate and
+// only one client slot, so it must never start just because an address was
+// given. The secured Unix socket is the recommended path.
+guard cfg.enableTCP else {
+    fail("legacy TCP/PTY mode is disabled by default since v0.2.0; "
+         + "use --unix-socket <path> (recommended) or pass --tcp explicitly", code: 2)
 }
 let deviceAddress = normaliseAddress(cfg.address)
 
@@ -463,7 +481,11 @@ Thread.detachNewThread {
     while true {
         let client = accept(listener.fd, nil, nil)
         if client < 0 { usleep(100_000); continue }
-        relay.attach(client)
+        guard relay.attach(client) else {
+            note("rejected client: legacy relay serves one client at a time")
+            close(client)
+            continue
+        }
         note("client connected from \(peerDescription(client))")
 
         Thread.detachNewThread {

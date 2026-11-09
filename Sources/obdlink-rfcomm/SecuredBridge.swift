@@ -306,6 +306,7 @@ final class SecuredBridge {
     let verbose: Bool
 
     private var listenFD: Int32 = -1
+    private var lifecycle: SocketLifecycle?
     private var adapterName = ""
     private var stnName = ""
     private var identified = false
@@ -382,11 +383,17 @@ final class SecuredBridge {
     }
 
     func run() -> Never {
-        unlink(socketPath)
-        let dir = (socketPath as NSString).deletingLastPathComponent
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
-                                                 attributes: [.posixPermissions: 0o700])
-        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+        let lifecycle = SocketLifecycle(socketPath: socketPath)
+        self.lifecycle = lifecycle
+        do {
+            try lifecycle.prepareDirectory()
+            try lifecycle.acquireLock()
+            try lifecycle.clearStaleSocket()
+        } catch let e as SocketLifecycleError {
+            fail("secured socket: \(e)", code: e.exitCode)
+        } catch {
+            fail("secured socket: \(error)", code: 6)
+        }
 
         listenFD = socket(AF_UNIX, SOCK_STREAM, 0)
         guard listenFD >= 0 else { fail("unix socket() failed", code: 6) }
@@ -407,8 +414,20 @@ final class SecuredBridge {
             }
         }
         guard bindRC == 0 else { fail("unix bind failed on \(socketPath)", code: 6) }
-        chmod(socketPath, 0o600)
-        guard listen(listenFD, 1) == 0 else { fail("unix listen failed", code: 6) }
+        guard chmod(socketPath, 0o600) == 0 else {
+            lifecycle.release()
+            fail("cannot set socket permissions 0600: errno \(errno)", code: 6)
+        }
+        guard listen(listenFD, 1) == 0 else {
+            lifecycle.release()
+            fail("unix listen failed", code: 6)
+        }
+        do {
+            try lifecycle.recordBoundSocket()
+        } catch {
+            lifecycle.release()
+            fail("cannot record socket identity: \(error)", code: 6)
+        }
 
         print("READY \(socketPath) mode=\(mode.rawValue) simulated=\(mode.isSimulated)")
         fflush(stdout)
@@ -435,6 +454,11 @@ final class SecuredBridge {
         }
     }
 
+    /// Runs from the signal handler: removes only the node this process bound.
+    func cleanup() {
+        lifecycle?.release()
+    }
+
     private func handle(client: Int32) {
         let f = fdopen(client, "r+")
         guard let f = f else { return }
@@ -448,7 +472,17 @@ final class SecuredBridge {
             fflush(f)
         }
 
-        guard let first = readLine(from: f), let hello = parse(first) else {
+        let firstRead = readLine(from: f)
+        let firstText: String
+        switch firstRead {
+        case .eof:
+            return
+        case .tooLong:
+            send(["type": "error", "reason": "message too long"]); return
+        case .line(let text):
+            firstText = text
+        }
+        guard let hello = parse(firstText) else {
             send(["type": "error", "reason": "invalid json"]); return
         }
         guard hello["type"] as? String == "hello" else {
@@ -474,7 +508,22 @@ final class SecuredBridge {
         send(["type": "hello_ack", "protocol": 1, "adapter": adapterName,
               "stn": stnName, "mode": mode.wireMode, "simulated": mode.isSimulated])
 
-        while let raw = readLine(from: f), let msg = parse(raw) {
+        while true {
+            let next = readLine(from: f)
+            let msg: [String: Any]
+            switch next {
+            case .eof:
+                return
+            case .tooLong:
+                // Deterministic rejection instead of a silent close: v1 gains no
+                // new field, only a defined answer where it used to be silent.
+                send(["type": "error", "reason": "message too long"]); return
+            case .line(let raw):
+                guard let parsed = parse(raw) else {
+                    send(["type": "error", "reason": "invalid json"]); return
+                }
+                msg = parsed
+            }
             switch msg["type"] as? String {
             case "write":
                 let data = (msg["data"] as? String) ?? ""
@@ -509,10 +558,28 @@ final class SecuredBridge {
         }
     }
 
-    private func readLine(from f: UnsafeMutablePointer<FILE>) -> String? {
+    /// Outcome of one read attempt. Distinguishes EOF, an over-long line and a
+    /// normal line so the caller can answer each case deterministically.
+    private enum LineRead {
+        case line(String)
+        case tooLong
+        case eof
+    }
+
+    private func readLine(from f: UnsafeMutablePointer<FILE>) -> LineRead {
         var line = [CChar](repeating: 0, count: 8192)
-        guard fgets(&line, Int32(line.count), f) != nil else { return nil }
-        return String(cString: line).trimmingCharacters(in: .newlines)
+        guard fgets(&line, Int32(line.count), f) != nil else { return .eof }
+        let text = String(cString: line)
+        if !text.hasSuffix("\n") && text.utf8.count >= line.count - 1 {
+            // Drain the rest of the line without buffering it, so a huge message
+            // cannot grow memory and cannot leak into the next line.
+            var sink = [CChar](repeating: 0, count: 1024)
+            while fgets(&sink, Int32(sink.count), f) != nil {
+                if String(cString: sink).hasSuffix("\n") { break }
+            }
+            return .tooLong
+        }
+        return .line(text.trimmingCharacters(in: .newlines))
     }
 
     private func parse(_ text: String) -> [String: Any]? {

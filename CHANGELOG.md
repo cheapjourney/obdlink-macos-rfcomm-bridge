@@ -3,6 +3,30 @@
 All notable changes to this project are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — 2026-11-09 (candidate, not tagged)
+
+### Added
+- Secured Unix-socket mode with NDJSON v1 and a two-mode command gate.
+- Deterministic NDJSON errors: `invalid json` and `message too long` are answered,
+  not silent.
+- Socket lifecycle: flock (exit 7), path type check (exit 8), inode-checked cleanup,
+  directory never chmod'ed after creation.
+- 10 additional self-test checks for the secured mode (22 total).
+
+### Changed
+- Legacy TCP/PTY relay is opt-in via `--tcp` (breaking; no gate on that path).
+- Legacy relay rejects a second concurrent client instead of displacing the first.
+
+### Security
+- A second instance can no longer delete a running instance's socket.
+- Regular files and symlinks at the socket path are refused, never deleted or followed.
+
+### Known gaps
+- No correlation IDs or timestamps in NDJSON v1; one request at a time.
+- `blocked` carries free-text reason, no error code.
+- Allowlist is vehicle-specific.
+- Byte-identical builds not proven with Swift 5.7.2.
+
 ## [0.1.0] - 2026-11-07
 
 First public release.
