@@ -3,7 +3,7 @@
 All notable changes to this project are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## [0.2.0] — 2026-11-09 (candidate, not tagged)
+## [0.2.0] — 2026-11-09
 
 ### Added
 - Secured Unix-socket mode with NDJSON v1 and a two-mode command gate.
@@ -11,7 +11,7 @@ This project follows [Semantic Versioning](https://semver.org/).
   not silent.
 - Socket lifecycle: flock (exit 7), path type check (exit 8), inode-checked cleanup,
   directory never chmod'ed after creation.
-- 10 additional self-test checks for the secured mode (22 total).
+- 10 additional self-test checks for the secured mode (23 total).
 
 ### Changed
 - Legacy TCP/PTY relay is opt-in via `--tcp` (breaking; no gate on that path).

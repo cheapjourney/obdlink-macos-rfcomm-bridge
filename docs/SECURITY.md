@@ -30,3 +30,27 @@ Fahrzeugzustand.
 - Der Token-Vergleich ist ein normaler String-Vergleich, keine konstante Laufzeit.
 - Die Allowlist ist fahrzeugspezifisch (Smart 453, EMM/Headunit) und nicht übertragbar.
 - Integrität beruht auf Dateisystemrechten und SSH, nicht auf Signaturen.
+
+## Bekannte niedrige Cleanup-Einschränkungen (v0.2.0)
+
+Diese Punkte sind lokale Same-User-Risiken. Sie überschreiten keine
+Privilegiengrenze und ermöglichen keinen Remote- oder CAN-Bypass. Sie werden in
+dieser Dokumentationsphase **nicht** durch Codeänderungen behoben.
+
+- **O-1 — Post-Bind-Fehlerpfad:** Nach erfolgreichem `bind` kann ein Fehler bei
+  `chmod`, `listen` oder `recordBoundSocket` den gerade erzeugten Socket
+  zurücklassen, weil `release()` vor dem Setzen von `ownsSocket` aufgerufen wird.
+  Der nächste Start erkennt den Node als verwaist; der Fehlerpfad selbst räumt
+  ihn nicht auf.
+- **O-2 — zusätzliche UID-Prüfung im Cleanup:** `recordBoundSocket()` prüft den
+  aktuellen Node nicht auf `S_IFSOCK` und Eigentümerschaft; `release()` prüft
+  Inode/Device/Typ, aber nicht die UID. Ein Same-User-Prozess könnte den Node im
+  kurzen Fenster nach dem Bind ersetzen.
+- **O-3 — theoretische Same-User-Race-Condition:** Die Inode-/Device-Prüfung vor
+  `unlink` und der `unlink` selbst sind nicht atomar. Ein Same-User-Prozess kann
+  theoretisch dazwischen den Pfad ersetzen; es wird keine Privilegiengrenze
+  überschritten.
+
+Die drei Punkte sind in den Phase-10.7-/10.8-Berichten als niedrig eingestuft.
+Sie sind keine allgemeine Sicherheitsgarantie und kein Ersatz für eine
+Client-Disziplin.

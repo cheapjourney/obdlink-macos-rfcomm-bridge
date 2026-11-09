@@ -1,41 +1,80 @@
-# Release blockers — v0.2.0 (branch fix/v0.2.0-release-hardening)
+# Pre-release limitations — v0.2.0
 
-Stand 2026-11-09, Basis `465411b`. Was hier noch steht, ist nach diesem Branch offen.
+Status record: 2026-11-09. Basis: `main` at `882e51f`, branch
+`fix/v0.2.0-release-hardening`, code head `da9dc65`. This is a
+documentation/limitations record, not a tag or release record. The repository's
+tag and release metadata is authoritative for publication state.
 
-## Erledigt auf diesem Branch
+## Resolved on this branch
 
-| Blocker | Lösung |
+| Blocker | Resolution |
 |---|---|
-| Socket-Ownership | `SocketLifecycle`: flock, lstat-Typprüfung, Live-Probe, Inode-Vergleich vor `unlink`, Cleanup nur für den eigenen Node |
-| Verzeichnis wurde blind auf 0700 gesetzt | Verzeichnis wird nur angelegt, nie nachträglich geändert; gruppen-/weltbeschreibbar ⇒ Abbruch |
-| `chmod`-Rückgabewert ignoriert | geprüft, Fehler ⇒ Exit 6 nach Cleanup |
-| Zweite Instanz | Exit 7, die erste bleibt erreichbar |
-| NDJSON: stiller Abbau nach dem Handshake | `error: invalid json` als strukturierte Antwort, dann Verbindung zu |
-| Überlange Nachricht | deterministisch `error: message too long`, Zeilenrest wird verworfen |
-| Legacy-TCP ohne Gate | nur noch mit `--tcp`, sonst Exit 2; zweiter Client wird abgewiesen |
-| Selbsttest ohne Socket-Modus | 10 zusätzliche Prüfungen (Lock, Typprüfung, stale/live, Rechte, Ownership) |
+| Socket ownership | `SocketLifecycle`: flock, lstat type check, live probe, inode comparison before `unlink`, cleanup only for the recorded own node |
+| Directory was blindly set to 0700 | Directory is only created, never changed afterwards; group/world-writable ⇒ abort |
+| `chmod` return value ignored | checked; failure ⇒ Exit 6 after cleanup |
+| Second instance | Exit 7; the first instance remains reachable |
+| NDJSON silent close after handshake | `error: invalid json` as structured response, then close |
+| Overlong message | deterministic `error: message too long`; rest of line discarded |
+| Legacy TCP without gate | only with `--tcp`, otherwise Exit 2; second client rejected |
+| Self-test without socket mode | lifecycle checks added; current baseline 23/23 |
 
-## Offen (nicht blockierend für Review, blockierend für Tag)
+## Known limitations (not release-blocking)
 
-1. **Keine Korrelations-ID** in NDJSON v1 — bewusst nicht geändert; Vertrag bleibt
-   „ein Request zur Zeit". Ein v2-Vorschlag ist dokumentiert, nicht implementiert.
-2. **`blocked` ohne Fehlercode** — Freitext bleibt v1-kompatibel.
-3. **Allowlist ist fahrzeugspezifisch** — muss im README als Profil mit Prüfdatum stehen,
-   nicht als universelle Funktion.
-4. **Byte-identische Builds** — mit Swift 5.7.2 auf macOS 12.7.6 nicht nachgewiesen
-   (Toolchain-/SDK-Metadaten). Reproduzierbar ist der Ablauf, nicht das Byte-Ergebnis.
-5. **Kein Fahrzeugtest dieser Version.** Die neue Lifecycle-Logik ist rein lokal geprüft;
-   die letzte Fahrzeugmessung lief auf `465411b`.
+1. **No correlation ID** in NDJSON v1 — deliberately unchanged; the contract is
+   one request at a time. A v2 proposal is documented, not implemented.
+2. **`blocked` without an error code** — free-text remains v1-compatible.
+3. **Allowlist is vehicle-specific** — it is a Smart 453 EMM/headunit profile,
+   not a universal security function. See `docs/ALLOWLIST.md`.
+4. **Byte-identical builds** — not proven with Swift 5.7.2 on macOS 12.7.6;
+   the process is reproducible, not the byte result.
+5. **Legacy helper scripts** — `scripts/start.sh` and `scripts/verify.sh` predate
+   the `--tcp` opt-in and do not add it. They are not v0.2.0 launchers as written.
+6. **Low-severity cleanup observations O-1 to O-3** — documented in
+   `docs/SECURITY.md`; they are local, same-user limitations, not a remote or
+   vehicle-safety bypass. They were not code-changed in this documentation
+   phase.
 
-## Abgleich mit Phase 9.0 (Audit vom 2026-11-09)
+## Vehicle validation
 
-Phase 9.0 hat vier Bridge-Blocker festgehalten. Stand auf diesem Branch:
+The hardened code head `da9dc65` received a **limited read-only function test** on
+2026-11-09 with an OBDLink MX+ r3.1.3 / STN2255 v5.10.3:
 
-| ID | Blocker (9.0) | Status jetzt |
+- EMM `21 80`: 26-byte response, byte-identical to the baseline.
+- EMM `21 07`: `61 07 00` (3 bytes), byte-identical to the baseline.
+- Headunit `21 80`: 26-byte response, byte-identical to the historical baseline.
+- Headunit `22 F1 87`: 13-byte identity response, byte-identical.
+- Headunit `22 6C 1C`: `62 6C 1C 78`, unchanged from the historical read-back.
+
+No session, write, configuration change, reset or security access was performed.
+The initial harness sent `21 07` with the default header to `0x7E0`; the
+negative answer `7E8 03 7F 21 12` was read-only and changed nothing. The harness
+was corrected before the successful measurements.
+
+This is not a general vehicle/diagnostic compatibility claim. Other services,
+sessions, writes, multimedia CAN, adapters, firmware and vehicles are untested.
+
+## CI status
+
+GitHub Actions on PR #1 runs on `macos-latest`:
+
+- Debug build;
+- Release build;
+- Swift self-test in both builds;
+- negative test: legacy TCP without `--tcp` must exit 2.
+
+For the code head `da9dc65`, both macOS check runs were successful. The workflow
+does **not** run the 15 lifecycle, 29 golden, 22 Python bridge or 63 parser
+tests; those are external MacBook results. A green CI badge is not evidence that
+all five suites ran on GitHub.
+
+## Phase 9.0 reconciliation
+
+| ID | Phase 9.0 blocker | Current status |
 |---|---|---|
-| B-1 | Socket-Ownership: bedingungsloses `unlink`, kein Lock/Inode-Check, Parent-chmod, ungeprüftes Socket-chmod | **GESCHLOSSEN** — `SocketLifecycle` mit flock, lstat-Typprüfung, Live-Probe, Inode-Vergleich, `O_NOFOLLOW` für die Lock-Datei, geprüftes chmod; 10 neue Selbsttest-Prüfungen + 15 Lifecycle-Regressionen |
-| B-2 | Selbsttest deckt den gesicherten Modus nicht ab | **GESCHLOSSEN für den Lifecycle** — 23 Selbsttest-Prüfungen. NDJSON/Gate bleiben in den Python-Golden-Tests (29), nicht im Swift-Selbsttest |
-| B-3 | Kein macOS-CI, kein reproduzierbares Release-Artefakt | **TEILWEISE** — `.github/workflows/ci.yml` vorhanden, auf GitHub noch nicht gelaufen; byte-identische Builds nicht nachgewiesen |
-| B-4 | 85-Test-Harness und 28 Golden Tests nicht im öffentlichen Repo | **TEILWEISE** — `tests/test_golden_protocol.py` (29 Prüfungen) und `tests/regression_secured_mode.py` (15) liegen jetzt im Repo; die Python-Parser-Suiten bleiben im separaten Projekt |
+| B-1 | Socket ownership: unconditional `unlink`, no lock/inode check, parent chmod, unchecked socket chmod | **CLOSED** — `SocketLifecycle` with flock, lstat type check, live probe, inode comparison, `O_NOFOLLOW` lock file, checked chmod; lifecycle tests added |
+| B-2 | Self-test does not cover secured mode | **CLOSED for lifecycle** — 23 self-test checks; NDJSON/gate remain in Python golden tests (29) |
+| B-3 | No macOS CI / reproducible release artifact | **PARTIAL** — CI exists and ran green for the code head; byte-identical builds remain unproven |
+| B-4 | Test harness and golden tests not public | **PARTIAL** — `tests/test_golden_protocol.py` (29) and `tests/regression_secured_mode.py` (15) are public; the Python parser suites remain external |
 
-Weiterhin gilt aus 9.0: die Bridge reassembliert **kein** ISO-TP (macht der Python-Client).
+The bridge still does **not** reassemble ISO-TP; that remains in the Python
+client.
